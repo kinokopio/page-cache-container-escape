@@ -1,0 +1,27 @@
+# pcce exec mode - 无 livenessProbe 版本
+# 需要手动触发: 先运行 exploit，再从另一个终端 kubectl exec 进容器
+# 适用于演示 "等待 kubectl exec 触发" 的场景
+#
+# 终端 1: kubectl exec -n pcce-demo pcce-manual -- /pcce exec --cmd 'touch /tmp/pwned-manual'
+# 终端 2: kubectl exec -n pcce-demo pcce-manual -- echo trigger
+# 验证: 宿主机 ls /tmp/pwned-manual
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pcce-manual
+  namespace: pcce-demo
+  labels:
+    app: pcce-manual
+spec:
+  containers:
+  - name: exploit
+    image: ubuntu:22.04
+    command: ["/bin/sh", "-c", "while sleep 3600; do :; done"]
+    securityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+    resources:
+      limits:
+        memory: "128Mi"
+        cpu: "200m"
+  restartPolicy: Always

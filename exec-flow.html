@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+body {
+    background: #ffffff;
+    font-family: -apple-system, 'PingFang SC', sans-serif;
+    padding: 30px 40px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+.flow {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+}
+.node {
+    border: 2px solid;
+    border-radius: 8px;
+    padding: 10px 18px;
+    text-align: center;
+    font-size: 12px;
+    min-width: 300px;
+    position: relative;
+}
+.arrow {
+    width: 0; height: 0;
+    border-left: 7px solid transparent;
+    border-right: 7px solid transparent;
+    border-top: 10px solid #90a4ae;
+    margin: 6px 0;
+}
+.label {
+    font-size: 10px;
+    color: #78909c;
+    margin: 2px 0 4px;
+}
+.divider {
+    width: 340px;
+    border: none;
+    border-top: 2px dashed #f57f17;
+    margin: 10px 0;
+    position: relative;
+}
+.divider-text {
+    position: absolute;
+    top: -9px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: white;
+    padding: 0 8px;
+    font-size: 10px;
+    color: #f57f17;
+    font-weight: bold;
+    white-space: nowrap;
+}
+
+.n-exploit { border-color: #1565c0; background: #e3f2fd; color: #0d47a1; }
+.n-kubelet { border-color: #6a1b9a; background: #f3e5f5; color: #4a148c; }
+.n-kernel { border-color: #e65100; background: #fff3e0; color: #e65100; }
+.n-attack { border-color: #c62828; background: #ffebee; color: #b71c1c; }
+.n-ok { border-color: #2e7d32; background: #e8f5e9; color: #1b5e20; }
+
+.side {
+    position: absolute;
+    right: -190px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 10px;
+    color: #78909c;
+    width: 170px;
+    text-align: left;
+    border-left: 2px solid #e0e0e0;
+    padding-left: 8px;
+}
+.side .red { color: #c62828; font-weight: bold; }
+</style>
+</head>
+<body>
+
+<div class="flow">
+    <div class="node n-exploit">
+        exploit: Copy Fail 覆写 /bin/sh → #!/proc/self/exe
+        <div class="side">只改前 17 字节</div>
+    </div>
+    <div class="arrow"></div>
+    <div class="node n-exploit">
+        exploit: 扫描 /proc 等待目标进程出现
+        <div class="side">循环检测新 PID</div>
+    </div>
+    <div class="arrow"></div>
+
+    <div style="position:relative">
+        <hr class="divider">
+        <span class="divider-text">livenessProbe 触发（每 5 秒自动）</span>
+    </div>
+
+    <div class="node n-kubelet">
+        kubelet → runc exec → 进入容器 PID ns
+        <div class="side">runc init 进程出现在容器 /proc</div>
+    </div>
+    <div class="arrow"></div>
+    <div class="node n-kernel">
+        execve("/bin/sh") → 内核读 page cache → shebang
+        <div class="side">/proc/self/exe = 宿主机 runc</div>
+    </div>
+    <div class="arrow"></div>
+    <div class="node n-kernel">
+        runc 作为解释器短暂存活于容器 PID ns
+    </div>
+    <div class="arrow"></div>
+
+    <div style="position:relative">
+        <hr class="divider">
+        <span class="divider-text">exploit 捕获到目标进程</span>
+    </div>
+
+    <div class="node n-attack">
+        exploit: open(/proc/&lt;pid&gt;/exe) → 拿到 runc fd
+        <div class="side"><span class="red">绕过 overlayfs clone 保护</span></div>
+    </div>
+    <div class="arrow"></div>
+    <div class="node n-attack">
+        exploit: Copy Fail 覆写 runc page cache → payload
+        <div class="side">#!/bin/bash\n&lt;cmd&gt;</div>
+    </div>
+    <div class="arrow"></div>
+
+    <div style="position:relative">
+        <hr class="divider">
+        <span class="divider-text">下次任何容器操作调用 runc</span>
+    </div>
+
+    <div class="node n-ok">
+        内核读 runc → shebang → bash(root) 执行 payload
+        <div class="side">kubelet 以 root 调用</div>
+    </div>
+</div>
+
+</body>
+</html>
