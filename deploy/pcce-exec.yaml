@@ -17,10 +17,12 @@ spec:
     # livenessProbe exec 类型会触发 runc exec 进容器
     # kubelet 每 5 秒调一次 runc exec -- /bin/sh -c 'true'
     # 这就是 pcce exec 的自动触发点
+    # 必须用 /bin/sh -c 形式，这样 runc exec 才会 execve /bin/sh
+    # 如果直接 ["true"]，runc exec 直接 execve /usr/bin/true，不经过 /bin/sh
     livenessProbe:
       exec:
-        command: ["true"]
-      initialDelaySeconds: 5
+        command: ["/bin/sh", "-c", "true"]
+      initialDelaySeconds: 10
       periodSeconds: 5
     securityContext:
       runAsUser: 1000
