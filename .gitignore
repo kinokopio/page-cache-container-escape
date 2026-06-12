@@ -1,3 +1,6 @@
+pcce
 pcce.bak
 *.o
+.cursor/
 .idea/
+doc/
