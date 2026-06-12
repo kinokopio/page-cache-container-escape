@@ -41,10 +41,7 @@ func Write(path string, offset int64, content []byte, write4 Write4Func) error {
 
 	for i := 0; i < len(content); i += ChunkSize {
 		currentOffset := offset + int64(i)
-		end := i + ChunkSize
-		if end > len(content) {
-			end = len(content)
-		}
+		end := min(i+ChunkSize, len(content))
 
 		var block [ChunkSize]byte
 		written := copy(block[:], content[i:end])
