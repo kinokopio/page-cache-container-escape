@@ -1,5 +1,6 @@
-pcce
-pcce.bak
+/pcce
+/pcce.bak
+cmd/pcce/injector-amd64.bin
 *.o
 .cursor/
 .idea/

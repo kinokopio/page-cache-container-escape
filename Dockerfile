@@ -2,7 +2,7 @@ FROM golang:1.22-bookworm AS builder
 
 WORKDIR /src
 COPY . .
-RUN make injector-amd64.bin && CGO_ENABLED=0 go build -o /pcce .
+RUN make pcce && cp /src/pcce /pcce
 
 FROM ubuntu:22.04
 COPY --from=builder /pcce /pcce
